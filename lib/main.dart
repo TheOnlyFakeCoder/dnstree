@@ -24,7 +24,6 @@ class DNSSECVisualizerApp extends StatelessWidget {
   }
 }
 
-// Data Model to hold information for each node in the chain
 class DnsNodeData {
   final String title;
   final List<String> details;
@@ -51,14 +50,12 @@ class _HomePageState extends State<HomePage> {
   final TransformationController _transformationController = TransformationController();
   bool _showGraph = false;
 
-  // GraphView Layout Configuration
   final Graph graph = Graph()..isTree = true;
   final BuchheimWalkerConfiguration builder = BuchheimWalkerConfiguration();
 
   @override
   void initState() {
     super.initState();
-    // Configure layout direction (Top to Bottom tree spacing)
     builder
       ..orientation = BuchheimWalkerConfiguration.ORIENTATION_TOP_BOTTOM
       ..siblingSeparation = 40
@@ -79,7 +76,6 @@ class _HomePageState extends State<HomePage> {
 
     if (sanitized.isEmpty) return;
 
-    // Capture the explicit dialog context to safely close it later
     BuildContext? dialogContext;
     showDialog(
       context: context,
@@ -91,7 +87,6 @@ class _HomePageState extends State<HomePage> {
     );
 
     try {
-      // 1. Break down domain into layers (e.g., '.', 'mx', 'gob.mx')
       List<String> parts = sanitized.split('.');
       List<String> domainChain = ['.'];
       String currentLayer = '';
@@ -104,7 +99,6 @@ class _HomePageState extends State<HomePage> {
       final freshGraph = Graph()..isTree = true;
       List<Node> createdNodes = [];
 
-      // 2. Fetch live DNSSEC records using Google DoH Service
       for (int i = 0; i < domainChain.length; i++) {
         String layerName = domainChain[i];
         bool isLeaf = (i == domainChain.length - 1);
@@ -118,7 +112,6 @@ class _HomePageState extends State<HomePage> {
         bool hasDs = false;
 
         if (layerName != '.') {
-          // QUERY GOOGLE FOR DNSKEY RECORDS (&do=true enables DNSSEC records)
           final dnskeyUri = Uri.parse('https://dns.google/resolve?name=$layerName&type=DNSKEY&do=true');
           final dnskeyResponse = await http.get(dnskeyUri, headers: {'Accept': 'application/json'});
           
@@ -127,8 +120,8 @@ class _HomePageState extends State<HomePage> {
             
             if (data['Answer'] != null) {
               for (var answer in data['Answer']) {
-                if (answer['type'] == 48) dnskeyCount++; // Type 48 = DNSKEY
-                if (answer['type'] == 46) rrsigCount++;  // Type 46 = RRSIG
+                if (answer['type'] == 48) dnskeyCount++; 
+                if (answer['type'] == 46) rrsigCount++;  
               }
               hasDnskey = dnskeyCount > 0;
             }
@@ -136,13 +129,12 @@ class _HomePageState extends State<HomePage> {
             if (data['Authority'] != null) {
               for (var auth in data['Authority']) {
                 if (auth['type'] == 46) rrsigCount++;
-                if (auth['type'] == 47) hasNsec = true;  // Type 47 = NSEC
-                if (auth['type'] == 50) hasNsec3 = true; // Type 50 = NSEC3
+                if (auth['type'] == 47) hasNsec = true;  
+                if (auth['type'] == 50) hasNsec3 = true; 
               }
             }
           }
 
-          // FALLBACK DIAGNOSTIC QUERY: Explicitly fetch authority proofs if counts are zero
           if (dnskeyCount == 0 || rrsigCount == 0) {
             final fallbackUri = Uri.parse('https://dns.google/resolve?name=$layerName&type=ANY&do=true');
             final fallbackResponse = await http.get(fallbackUri, headers: {'Accept': 'application/json'});
@@ -158,7 +150,6 @@ class _HomePageState extends State<HomePage> {
             }
           }
 
-          // QUERY GOOGLE FOR DS RECORDS
           final dsUri = Uri.parse('https://dns.google/resolve?name=$layerName&type=DS&do=true');
           final dsResponse = await http.get(dsUri, headers: {'Accept': 'application/json'});
           
@@ -166,7 +157,7 @@ class _HomePageState extends State<HomePage> {
             final data = jsonDecode(dsResponse.body);
             if (data['Answer'] != null) {
               for (var answer in data['Answer']) {
-                if (answer['type'] == 43) dsCount++; // Type 43 = DS
+                if (answer['type'] == 43) dsCount++;
                 if (answer['type'] == 46) rrsigCount++;
               }
               hasDs = dsCount > 0;
@@ -177,20 +168,18 @@ class _HomePageState extends State<HomePage> {
           hasDs = true;
         }
 
-        // 3. Process status colors and information arrays based on your flow diagrams
         Color statusColor;
         List<String> details = [];
         String edgeLabel = '';
 
         if (layerName == '.') {
-          statusColor = const Color(0xFF2E7D32); // Deep Green
+          statusColor = const Color(0xFF2E7D32); 
           details = const ['Root Anchor', 'DNSKEY: Active'];
         } else {
           if (isLeaf) {
             details.add('DNSKEY: ${hasDnskey ? dnskeyCount : "no obs."}');
             details.add('RRSIG: ${rrsigCount > 0 ? rrsigCount : "no obs."}');
             
-            // Evaluates parent authenticated denial of existence signatures
             if (!hasDnskey || hasNsec3 || rrsigCount > 0) {
               details.add('Evidencia en autoridad: NSEC3 y RRSIG');
               statusColor = Colors.greenAccent;
@@ -213,7 +202,7 @@ class _HomePageState extends State<HomePage> {
               edgeLabel = 'DS → DNSKEY OK';
               details.add('DS validado');
             } else {
-              statusColor = const Color(0xFFD4AF37); // Gold / Amber Warning
+              statusColor = const Color(0xFFD4AF37); 
               edgeLabel = 'DS: no obs.';
             }
           }
@@ -227,7 +216,6 @@ class _HomePageState extends State<HomePage> {
         )));
       }
 
-      // 4. Wire edges together sequentially
       for (int i = 0; i < createdNodes.length - 1; i++) {
         Node parent = createdNodes[i];
         Node child = createdNodes[i + 1];
@@ -240,7 +228,6 @@ class _HomePageState extends State<HomePage> {
         );
       }
 
-      // Dismiss dialog spinner safely utilizing the tracked instance context
       if (dialogContext != null && mounted) {
         Navigator.pop(dialogContext!);
       }
@@ -254,7 +241,6 @@ class _HomePageState extends State<HomePage> {
         _showGraph = true;
       });
 
-      // Snaps the viewport translation metrics clean to center matrix
       WidgetsBinding.instance.addPostFrameCallback((_) {
         _transformationController.value = Matrix4.identity();
       });
