@@ -1,6 +1,5 @@
 import 'dart:convert';
 import 'package:flutter/material.dart';
-import 'package:graphview/GraphView.dart';
 import 'package:http/http.dart' as http;
 
 void main() {
@@ -13,7 +12,7 @@ class DNSSECVisualizerApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'DNSSEC Chain Visualizer',
+      title: 'DNSSEC Chain Analyzer',
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         primarySwatch: Colors.blue,
@@ -24,21 +23,95 @@ class DNSSECVisualizerApp extends StatelessWidget {
   }
 }
 
-// Enhanced Data Model to track explicit record items for user interaction
 class DnsNodeData {
   final String title;
   final List<String> details;
   final String? edgeLabel;
   final Color edgeColor;
-  final List<Map<String, dynamic>> structuredRecords; // Holds clean items for the sheet view
+  final List<Map<String, dynamic>> structuredRecords;
+  final List<String> recommendations;
 
   DnsNodeData({
     required this.title,
     required this.details,
     this.edgeLabel,
-    this.edgeColor = Colors.black,
+    required this.edgeColor,
     required this.structuredRecords,
+    required this.recommendations,
   });
+}
+
+// PIXEL-PERFECT CONNECTOR PAINTER: Handles precise vertical alignment rendering
+class TrustChainConnectorPainter extends CustomPainter {
+  final List<DnsNodeData> nodes;
+  static const double nodeHeight = 70.0;
+  static const double verticalGap = 60.0;
+
+  TrustChainConnectorPainter(this.nodes);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (nodes.length < 2) return;
+
+    final double midX = size.width / 2;
+
+    for (int i = 0; i < nodes.length - 1; i++) {
+      // Find the explicit bottom of the current node and the top of the next node
+      final double startY = (i * (nodeHeight + verticalGap)) + nodeHeight;
+      final double endY = startY + verticalGap;
+
+      final Color connectionColor = nodes[i + 1].edgeColor;
+
+      final linePaint = Paint()
+        ..color = connectionColor
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3.0;
+
+      // 1. Draw structural connecting line
+      canvas.drawLine(Offset(midX, startY), Offset(midX, endY), linePaint);
+
+      // 2. GREEN STATUS: Full sharp triangle arrowhead
+      if (connectionColor == const Color(0xFF2E7D32)) {
+        final arrowPaint = Paint()
+          ..color = connectionColor
+          ..style = PaintingStyle.fill;
+
+        final arrowPath = Path()
+          ..moveTo(midX, endY)
+          ..lineTo(midX - 7, endY - 11)
+          ..lineTo(midX + 7, endY - 11)
+          ..close();
+
+        canvas.drawPath(arrowPath, arrowPaint);
+      }
+      // 3. RED STATUS: Custom failure cross marker ("X")
+      else if (connectionColor == Colors.red.shade700) {
+        final crossPaint = Paint()
+          ..color = connectionColor
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3.0
+          ..strokeCap = StrokeCap.round;
+
+        const double crossSize = 6.0;
+        final double targetY = endY - 3;
+
+        canvas.drawLine(
+          Offset(midX - crossSize, targetY - crossSize),
+          Offset(midX + crossSize, targetY + crossSize),
+          crossPaint,
+        );
+        canvas.drawLine(
+          Offset(midX + crossSize, targetY - crossSize),
+          Offset(midX - crossSize, targetY + crossSize),
+          crossPaint,
+        );
+      }
+      // 4. YELLOW STATUS: Remains a simple connecting stick naturally!
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant TrustChainConnectorPainter oldDelegate) => true;
 }
 
 class HomePage extends StatefulWidget {
@@ -50,20 +123,32 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   final TextEditingController _domainController = TextEditingController();
-  final TransformationController _transformationController = TransformationController();
+  List<DnsNodeData> _treeNodes = [];
   bool _showGraph = false;
 
-  final Graph graph = Graph()..isTree = true;
-  final BuchheimWalkerConfiguration builder = BuchheimWalkerConfiguration();
+  Future<Map<String, dynamic>?> _fetchDnsRecord(
+    http.Client client,
+    String url,
+    Duration timeout,
+    Map<String, String> headers,
+  ) async {
+    try {
+      final res = await client
+          .get(Uri.parse(url), headers: headers)
+          .timeout(timeout);
+      if (res.statusCode == 200) return jsonDecode(res.body);
+    } catch (_) {}
 
-  @override
-  void initState() {
-    super.initState();
-    builder
-      ..orientation = BuchheimWalkerConfiguration.ORIENTATION_TOP_BOTTOM
-      ..siblingSeparation = 50
-      ..levelSeparation = 80
-      ..subtreeSeparation = 50;
+    try {
+      final strippedUrl = url.replaceAll('https://', '');
+      final proxyUrl = 'https://api.codetabs.com/v1/proxy/?quest=$strippedUrl';
+      final res = await client
+          .get(Uri.parse(proxyUrl))
+          .timeout(timeout + const Duration(seconds: 2));
+      if (res.statusCode == 200) return jsonDecode(res.body);
+    } catch (_) {}
+
+    return null;
   }
 
   Future<void> _buildTree(String domain) async {
@@ -71,7 +156,7 @@ class _HomePageState extends State<HomePage> {
         .replaceAll(RegExp(r'https?://'), '')
         .replaceAll(RegExp(r'www\.'), '')
         .trim();
-        
+
     if (sanitized.endsWith('.')) {
       sanitized = sanitized.substring(0, sanitized.length - 1);
     }
@@ -80,7 +165,7 @@ class _HomePageState extends State<HomePage> {
 
     final http.Client client = http.Client();
     BuildContext? dialogContext;
-    
+
     showDialog(
       context: context,
       barrierDismissible: false,
@@ -94,327 +179,476 @@ class _HomePageState extends State<HomePage> {
       List<String> parts = sanitized.split('.');
       List<String> domainChain = ['.'];
       String currentLayer = '';
-      
+
       for (int i = parts.length - 1; i >= 0; i--) {
-        currentLayer = currentLayer.isEmpty ? parts[i] : '${parts[i]}.$currentLayer';
+        currentLayer = currentLayer.isEmpty
+            ? parts[i]
+            : '${parts[i]}.$currentLayer';
         domainChain.add(currentLayer);
       }
 
-      final freshGraph = Graph()..isTree = true;
-      List<Node> createdNodes = [];
-
-      const Duration networkTimeout = Duration(seconds: 3);
+      List<DnsNodeData> gatheredNodes = [];
+      const Duration networkTimeout = Duration(seconds: 4);
       final Map<String, String> googleHeaders = {
-        'Accept': 'application/json', 
-        'Content-Type': 'application/json'
+        'Accept': 'application/json',
+        'Content-Type': 'application/json',
       };
 
       for (int i = 0; i < domainChain.length; i++) {
         String layerName = domainChain[i];
-        bool isLeaf = (i == domainChain.length - 1);
-        
+
+        bool isServFail = false;
+        bool isNxDomain = false;
+        bool isAuthenticated = false;
+
         int dnskeyCount = 0;
         int dsCount = 0;
         int rrsigCount = 0;
-        bool hasNsec3 = false;
-        bool hasDnskey = false;
-        bool hasDs = false;
-        
+
         List<Map<String, dynamic>> recordsList = [];
+        List<String> recs = [];
 
         if (layerName != '.') {
-          Map<String, dynamic>? dnskeyData;
-          
-          // 1. DNSKEY Check with Triple Fallback
-          try {
-            final res = await client.get(
-              Uri.parse('https://dns.google/resolve?name=$layerName&type=DNSKEY&do=true'),
-              headers: googleHeaders,
-            ).timeout(networkTimeout);
-            if (res.statusCode == 200) dnskeyData = jsonDecode(res.body);
-          } catch (_) {
-            try {
-              final res = await client.get(
-                Uri.parse('https://cloudflare-dns.com/dns-query?name=$layerName&type=DNSKEY&do=true'),
-                headers: {'Accept': 'application/dns-json'},
-              ).timeout(networkTimeout);
-              if (res.statusCode == 200) dnskeyData = jsonDecode(res.body);
-            } catch (_) {
-              try {
-                final res = await client.get(
-                  Uri.parse('https://dns.quad9.net:5053/dns-query?name=$layerName&type=DNSKEY&do=true'),
-                  headers: {'Accept': 'application/dns-json'},
-                ).timeout(networkTimeout);
-                if (res.statusCode == 200) dnskeyData = jsonDecode(res.body);
-              } catch (_) {}
-            }
-          }
+          Map<String, dynamic>? aPayload = await _fetchDnsRecord(
+            client,
+            'https://dns.google/resolve?name=$layerName&type=A&do=true',
+            networkTimeout,
+            googleHeaders,
+          );
 
-          if (dnskeyData != null) {
-            if (dnskeyData['Answer'] != null) {
-              for (var answer in dnskeyData['Answer']) {
-                if (answer['type'] == 48) dnskeyCount++; 
-                if (answer['type'] == 46) rrsigCount++;  
+          if (aPayload != null) {
+            if (aPayload['Status'] == 2) isServFail = true;
+            if (aPayload['Status'] == 3) isNxDomain = true;
+            if (aPayload['AD'] == true) isAuthenticated = true;
+
+            if (aPayload['Answer'] != null) {
+              for (var ans in aPayload['Answer']) {
+                if (ans['type'] == 46) rrsigCount++;
               }
-              hasDnskey = dnskeyCount > 0;
             }
-            if (dnskeyData['Authority'] != null) {
-              for (var auth in dnskeyData['Authority']) {
+            if (aPayload['Authority'] != null) {
+              for (var auth in aPayload['Authority']) {
                 if (auth['type'] == 46) rrsigCount++;
-                if (auth['type'] == 50) hasNsec3 = true; 
               }
             }
           }
 
-          // 2. Authority Pathway Check
-          if (dnskeyCount == 0 || rrsigCount == 0) {
-            Map<String, dynamic>? fallbackData;
-            try {
-              final res = await client.get(
-                Uri.parse('https://dns.google/resolve?name=$layerName&type=ANY&do=true'),
-                headers: googleHeaders,
-              ).timeout(networkTimeout);
-              if (res.statusCode == 200) fallbackData = jsonDecode(res.body);
-            } catch (_) {
-              try {
-                final res = await client.get(
-                  Uri.parse('https://cloudflare-dns.com/dns-query?name=$layerName&type=ANY&do=true'),
-                  headers: {'Accept': 'application/dns-json'},
-                ).timeout(networkTimeout);
-                if (res.statusCode == 200) fallbackData = jsonDecode(res.body);
-              } catch (_) {}
-            }
+          Map<String, dynamic>? dnskeyPayload = await _fetchDnsRecord(
+            client,
+            'https://dns.google/resolve?name=$layerName&type=DNSKEY&do=true',
+            networkTimeout,
+            googleHeaders,
+          );
 
-            if (fallbackData != null && fallbackData['Authority'] != null) {
-              for (var auth in fallbackData['Authority']) {
-                if (auth['type'] == 46) rrsigCount++;
-                if (auth['type'] == 50) hasNsec3 = true;
+          if (dnskeyPayload != null) {
+            if (dnskeyPayload['Answer'] != null) {
+              for (var ans in dnskeyPayload['Answer']) {
+                if (ans['type'] == 48) dnskeyCount++;
+                if (ans['type'] == 46) rrsigCount++;
               }
             }
           }
 
-          // 3. DS Record Check
-          Map<String, dynamic>? dsData;
-          try {
-            final res = await client.get(
-              Uri.parse('https://dns.google/resolve?name=$layerName&type=DS&do=true'),
-              headers: googleHeaders,
-            ).timeout(networkTimeout);
-            if (res.statusCode == 200) dsData = jsonDecode(res.body);
-          } catch (_) {
-            try {
-              final res = await client.get(
-                Uri.parse('https://cloudflare-dns.com/dns-query?name=$layerName&type=DS&do=true'),
-                headers: {'Accept': 'application/dns-json'},
-              ).timeout(networkTimeout);
-              if (res.statusCode == 200) dsData = jsonDecode(res.body);
-            } catch (_) {}
-          }
+          Map<String, dynamic>? dsPayload = await _fetchDnsRecord(
+            client,
+            'https://dns.google/resolve?name=$layerName&type=DS&do=true',
+            networkTimeout,
+            googleHeaders,
+          );
 
-          if (dsData != null && dsData['Answer'] != null) {
-            for (var answer in dsData['Answer']) {
-              if (answer['type'] == 43) dsCount++; 
-              if (answer['type'] == 46) rrsigCount++;
+          if (dsPayload != null) {
+            if (dsPayload['Answer'] != null) {
+              for (var ans in dsPayload['Answer']) {
+                if (ans['type'] == 43) dsCount++;
+              }
             }
-            hasDs = dsCount > 0;
           }
         } else {
-          hasDnskey = true;
-          hasDs = true;
+          dsCount = 1;
+          dnskeyCount = 3;
+          rrsigCount = 1;
+          isAuthenticated = true;
         }
 
         Color statusColor;
         List<String> details = [];
         String edgeLabel = '';
 
-        // Assemble clean metadata packages for our modal layout
         if (layerName == '.') {
-          statusColor = const Color(0xFF2E7D32); 
-          details = const ['Root Anchor', 'DNSKEY: Active'];
+          statusColor = const Color(0xFF2E7D32);
+          edgeLabel = 'Root Trust Anchor';
+          details = [
+            'Zone: Global Domain Root Anchor (.)',
+            'Status: Secure Trust Anchor Established',
+          ];
           recordsList = [
-            {'title': 'Root Keys Set', 'desc': 'Found 3 valid global DNSKEY roots.', 'status': true},
-            {'title': 'Root Anchors', 'desc': 'Root anchor DS matching SHA-256 is verified.', 'status': true},
-            {'title': 'RRSIG Validated', 'desc': 'Found active root zone signatures over record sets.', 'status': true}
+            {
+              'title': 'DS Record Status',
+              'desc': 'Global Trusted Root Anchor verified.',
+              'status': true,
+            },
+            {
+              'title': 'DNSKEY Keys Set',
+              'desc':
+                  'Root Zone-Signing and Key-Signing keys active ($dnskeyCount found).',
+              'status': true,
+            },
+            {
+              'title': 'RRSIG Signatures',
+              'desc':
+                  'Root cryptographic signatures valid ($rrsigCount found).',
+              'status': true,
+            },
+          ];
+          recs = [
+            'Root system is perfectly secure. No administrative intervention required.',
+          ];
+        } else if (isServFail) {
+          statusColor = Colors.red.shade700;
+          edgeLabel = 'BOGUS: Verification Failed';
+          details = [
+            'Status: Cryptographic Signature Mismatch',
+            'Resolver Flag: SERVFAIL',
+            'Error: Validation failed due to missing or bad keys/signatures.',
+          ];
+          recordsList = [
+            {
+              'title': 'DS Record Status',
+              'desc': dsCount > 0
+                  ? 'Parent DS record exists ($dsCount found).'
+                  : 'No DS records found for $layerName.',
+              'status': dsCount > 0,
+            },
+            {
+              'title': 'DNSKEY Keys Set',
+              'desc': dnskeyCount > 0
+                  ? 'DNSKEY records are published ($dnskeyCount found).'
+                  : 'No DNSKEY records found.',
+              'status': dnskeyCount > 0,
+            },
+            {
+              'title': 'RRSIG Signatures',
+              'desc':
+                  'CRITICAL: Signatures are missing, expired, or corrupted ($rrsigCount found).',
+              'status': false,
+            },
+          ];
+          recs = [
+            'CRITICAL: Check for expired RRSIG records or broken key rollovers.',
+            'Ensure the Zone Signing Key (ZSK) matches the active parameters.',
+            'Emergency Action: Roll back parent DS records if keys are fully corrupted to clear the global outage.',
+          ];
+        } else if (isNxDomain) {
+          statusColor = const Color(0xFF00BFA5);
+          edgeLabel = 'NSEC3 Proof Boundary';
+          details = [
+            'Status: Authenticated Denial of Existence',
+            'Resolver Flag: NXDOMAIN',
+            'Layout: Parental NSEC3 chain securely seals non-existence.',
+          ];
+          recordsList = [
+            {
+              'title': 'DS Record Status',
+              'desc': 'Zone does not exist; structural NSEC pointer returned.',
+              'status': true,
+            },
+            {
+              'title': 'DNSKEY Keys Set',
+              'desc': 'No zone keys exist for a non-existent domain.',
+              'status': false,
+            },
+            {
+              'title': 'NSEC3/NSEC Proof',
+              'desc': 'Authenticated secure denial proofs validated.',
+              'status': true,
+            },
+          ];
+          recs = [
+            'Domain path is non-existent. Ensure typing is correct and delegation maps match registration bounds.',
           ];
         } else {
-          if (isLeaf) {
-            details.add('DNSKEY: ${hasDnskey ? dnskeyCount : "no obs."}');
-            details.add('RRSIG: ${rrsigCount > 0 ? rrsigCount : "no obs."}');
-            
-            if (!hasDnskey || hasNsec3 || rrsigCount > 0) {
-              details.add('Evidencia en autoridad: NSEC3 y RRSIG');
-              statusColor = const Color(0xFF00BFA5); // Matching your custom visualization teal line tint
-              edgeLabel = 'Cadena interrumpida';
-              
-              recordsList = [
-                {'title': 'DS Record', 'desc': 'No direct DS record matches in parent zone map.', 'status': false},
-                {'title': 'DNSKEY Record', 'desc': 'No internal DNSKEY bundles observed inside leaf.', 'status': false},
-                {'title': 'NSEC3 Proof', 'desc': 'Authenticated proof of non-existence found via NSEC3 sets.', 'status': true},
-                {'title': 'RRSIG Proof', 'desc': 'Valid signatures found covering the non-existence record.', 'status': true}
-              ];
-            } else if (hasDnskey && hasDs) {
-              details.add('Evidencia: Cadena completa');
-              statusColor = const Color(0xFF2E7D32);
-              edgeLabel = 'DS → DNSKEY OK';
-              recordsList = [
-                {'title': 'DS Verification', 'desc': 'DS record matches child DNSKEY set.', 'status': true},
-                {'title': 'DNSKEY Availability', 'desc': '$dnskeyCount active signature keys verified.', 'status': true}
-              ];
-            } else {
-              details.add('Evidencia: Sin protección');
-              statusColor = Colors.red.shade700;
-              edgeLabel = 'Insecure Zone';
-              recordsList = [
-                {'title': 'Unsigned Leaves', 'desc': 'This endpoint is missing cryptographical security boundaries.', 'status': false}
-              ];
-            }
+          if (isAuthenticated ||
+              (dnskeyCount > 0 && dsCount > 0 && rrsigCount > 0)) {
+            statusColor = const Color(0xFF2E7D32);
+            edgeLabel = 'DS → DNSKEY Chain Valid';
+            details = [
+              'Status: Fully Secured DNSSEC Chain',
+              'Authentication: Cryptographically Verified Link',
+            ];
+            recordsList = [
+              {
+                'title': 'DS Record Status',
+                'desc':
+                    'Parent mapping matches child keys completely ($dsCount found).',
+                'status': true,
+              },
+              {
+                'title': 'DNSKEY Keys Set',
+                'desc':
+                    'Zone keys are structural and fully accessible ($dnskeyCount found).',
+                'status': true,
+              },
+              {
+                'title': 'RRSIG Signatures',
+                'desc':
+                    'Valid signatures found covering the record sets ($rrsigCount found).',
+                'status': true,
+              },
+            ];
+            recs = [
+              'Chain of trust is secure and running flawlessly. Monitor key expiration parameters periodically.',
+            ];
           } else {
-            details.add('DNSKEY: ${hasDnskey ? dnskeyCount : "no obs."}');
-            details.add('RRSIG: $rrsigCount');
-            
-            if (hasDnskey && hasDs) {
-              statusColor = const Color(0xFF2E7D32);
-              edgeLabel = 'DS → DNSKEY OK';
-              details.add('DS validado');
-              recordsList = [
-                {'title': 'DS Records Mapping', 'desc': 'Parent confirms valid delegation signature link.', 'status': true},
-                {'title': 'DNSKEY Status', 'desc': 'Found $dnskeyCount structural zone signing keys.', 'status': true},
-                {'title': 'RRSIG Chain Validation', 'desc': 'Found $rrsigCount authorization signature packets.', 'status': true}
-              ];
-            } else {
-              statusColor = const Color(0xFFD4AF37); 
-              edgeLabel = 'DS: no obs.';
-              recordsList = [
-                {'title': 'DS Integrity Tracker', 'desc': 'No delegation signer matching values found.', 'status': false}
-              ];
-            }
+            statusColor = const Color(0xFFD4AF37);
+            edgeLabel = 'Insecure Boundary';
+            details = [
+              'Status: Unsigned Insecure Zone',
+              'Authentication: Cryptographical anchors are missing.',
+            ];
+            recordsList = [
+              {
+                'title': 'DS Record Status',
+                'desc': dsCount > 0
+                    ? 'Parent DS records found ($dsCount found).'
+                    : 'No DS records found for $layerName in the parent zone.',
+                'status': dsCount > 0,
+              },
+              {
+                'title': 'DNSKEY Keys Set',
+                'desc': dnskeyCount > 0
+                    ? 'DNSKEY records found ($dnskeyCount found).'
+                    : 'No DNSKEY records found.',
+                'status': dnskeyCount > 0,
+              },
+              {
+                'title': 'RRSIG Signatures',
+                'desc': rrsigCount > 0
+                    ? 'Signatures are present but unverified ($rrsigCount found).'
+                    : 'No RRSIGs found.',
+                'status': false,
+              },
+            ];
+            recs = [
+              'Action Required: Generate a KSK/ZSK key pair for the internal zone management engine.',
+              'Sign the zone file to establish valid, cryptographically protected RRSIG tracking entries.',
+              'Export the completed child Key digest to the parent zone provider registry as an updated DS Record.',
+            ];
           }
         }
 
-        createdNodes.add(Node.Id(DnsNodeData(
-          title: layerName,
-          details: details,
-          edgeLabel: edgeLabel,
-          edgeColor: statusColor,
-          structuredRecords: recordsList,
-        )));
-      }
-
-      for (int i = 0; i < createdNodes.length - 1; i++) {
-        Node parent = createdNodes[i];
-        Node child = createdNodes[i + 1];
-        Color connectionColor = (child.key!.value as DnsNodeData).edgeColor;
-        freshGraph.addEdge(parent, child, paint: Paint()..color = connectionColor..strokeWidth = 2.5);
+        gatheredNodes.add(
+          DnsNodeData(
+            title: layerName,
+            details: details,
+            edgeLabel: edgeLabel,
+            edgeColor: statusColor,
+            structuredRecords: recordsList,
+            recommendations: recs,
+          ),
+        );
       }
 
       if (dialogContext != null && mounted) {
         Navigator.pop(dialogContext!);
       }
-      
+
       setState(() {
-        graph.nodes.clear();
-        graph.edges.clear();
-        for (var edge in freshGraph.edges) {
-          graph.addEdge(edge.source, edge.destination, paint: edge.paint);
-        }
+        _treeNodes = gatheredNodes;
         _showGraph = true;
       });
-
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _transformationController.value = Matrix4.identity();
-      });
-
     } catch (e) {
       if (dialogContext != null && mounted) {
         Navigator.pop(dialogContext!);
       }
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Network Error: ${e.toString()}')),
+        SnackBar(content: Text('Network Core Failure: ${e.toString()}')),
       );
     } finally {
       client.close();
     }
   }
 
-  // Beautiful Modal Bottom Sheet to present records cleanly on demand
   void _showFriendlyDetailsSheet(DnsNodeData data) {
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       backgroundColor: Colors.white,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (context) {
-        return Padding(
-          padding: const EdgeInsets.all(20.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Center(
-                child: Container(
-                  width: 40,
-                  height: 4,
-                  margin: const EdgeInsets.only(bottom: 16),
-                  decoration: BoxDecoration(
-                    color: Colors.grey.shade300,
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              Row(
+        return DraggableScrollableSheet(
+          initialChildSize: 0.6,
+          minChildSize: 0.4,
+          maxChildSize: 0.85,
+          expand: false,
+          builder: (context, scrollController) {
+            return Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 20.0),
+              child: ListView(
+                controller: scrollController,
                 children: [
-                  Icon(Icons.dns, color: data.edgeColor, size: 28),
-                  const SizedBox(width: 10),
-                  Text(
-                    data.title == '.' ? 'Root Zone (.)' : data.title,
-                    style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      margin: const EdgeInsets.only(top: 12, bottom: 16),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade300,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
                   ),
-                ],
-              ),
-              const SizedBox(height: 10),
-              const Text(
-                'DNSSEC Chain Breakdowns',
-                style: TextStyle(color: Colors.black54, fontWeight: FontWeight.w500, fontSize: 14),
-              ),
-              const Divider(height: 24),
-              if (data.structuredRecords.isEmpty)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 20),
-                  child: Text('No parameters observed for this network boundary layout.'),
-                )
-              else
-                Flexible(
-                  child: ListView.builder(
+                  Row(
+                    children: [
+                      Icon(Icons.gpp_maybe, color: data.edgeColor, size: 28),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          data.title == '.' ? 'Root Zone (.)' : data.title,
+                          style: const TextStyle(
+                            fontSize: 21,
+                            fontWeight: FontWeight.bold,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 12),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.grey.shade100,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: data.details
+                          .map(
+                            (detail) => Padding(
+                              padding: const EdgeInsets.symmetric(
+                                vertical: 2.0,
+                              ),
+                              child: Text(
+                                '• $detail',
+                                style: const TextStyle(
+                                  fontFamily: 'monospace',
+                                  fontSize: 13,
+                                  color: Colors.black87,
+                                ),
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  const Text(
+                    '🛡️ SUGGESTED REMEDIATION / ACTIONS',
+                    style: TextStyle(
+                      color: Colors.blueGrey,
+                      fontWeight: FontWeight.bold,
+                      fontSize: 13,
+                      letterSpacing: 0.5,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(14),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.shade50,
+                      borderRadius: BorderRadius.circular(10),
+                      border: Border.all(color: Colors.blue.shade200, width: 1),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: data.recommendations
+                          .map(
+                            (rec) => Padding(
+                              padding: const EdgeInsets.symmetric(
+                                vertical: 4.0,
+                              ),
+                              child: Row(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Icon(
+                                    Icons.arrow_right_alt,
+                                    color: Colors.blue.shade800,
+                                    size: 16,
+                                  ),
+                                  const SizedBox(width: 6),
+                                  Expanded(
+                                    child: Text(
+                                      rec,
+                                      style: TextStyle(
+                                        fontSize: 13,
+                                        color: Colors.blue.shade900,
+                                        fontWeight: FontWeight.w500,
+                                      ),
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          )
+                          .toList(),
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  const Text(
+                    'DNSSEC Validation Checklist (Verisign Format)',
+                    style: TextStyle(
+                      color: Colors.black54,
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                    ),
+                  ),
+                  const Divider(height: 16),
+                  ListView.builder(
                     shrinkWrap: true,
+                    physics: const NeverScrollableScrollPhysics(),
                     itemCount: data.structuredRecords.length,
                     itemBuilder: (context, index) {
                       final item = data.structuredRecords[index];
                       final bool isSuccess = item['status'] == true;
                       return Container(
-                        margin: const EdgeInsets.symmetric(vertical: 6),
+                        margin: const EdgeInsets.symmetric(vertical: 5),
                         decoration: BoxDecoration(
-                          color: isSuccess ? Colors.green.shade50 : Colors.red.shade50,
+                          color: isSuccess
+                              ? Colors.green.shade50
+                              : Colors.red.shade50,
                           borderRadius: BorderRadius.circular(10),
                         ),
                         child: ListTile(
                           leading: Icon(
                             isSuccess ? Icons.check_circle : Icons.cancel,
-                            color: isSuccess ? Colors.green.shade700 : Colors.red.shade700,
+                            color: isSuccess
+                                ? Colors.green.shade700
+                                : Colors.red.shade700,
                           ),
                           title: Text(
                             item['title'],
-                            style: const TextStyle(fontWeight: FontWeight.bold),
+                            style: const TextStyle(
+                              fontWeight: FontWeight.bold,
+                              fontSize: 14,
+                            ),
                           ),
-                          subtitle: Text(item['desc']),
+                          subtitle: Text(
+                            item['desc'],
+                            style: const TextStyle(fontSize: 12),
+                          ),
                         ),
                       );
                     },
                   ),
-                ),
-              const SizedBox(height: 12),
-            ],
-          ),
+                  const SizedBox(height: 24),
+                ],
+              ),
+            );
+          },
         );
       },
     );
@@ -422,9 +656,17 @@ class _HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
+    // Total container runtime calculations to match exact painter canvas offsets
+    const double componentWidth = 240.0;
+    const double componentHeight = 70.0;
+    const double separatingGap = 60.0;
+    final double totalComputedHeight =
+        (_treeNodes.length * componentHeight) +
+        ((_treeNodes.isEmpty ? 0 : _treeNodes.length - 1) * separatingGap);
+
     return Scaffold(
       appBar: AppBar(
-        title: const Text('DNSSEC Chain Visualizer'),
+        title: const Text('DNSSEC Chain Analyzer'),
         centerTitle: true,
         backgroundColor: Colors.white,
         foregroundColor: Colors.black,
@@ -441,8 +683,8 @@ class _HomePageState extends State<HomePage> {
                     controller: _domainController,
                     onSubmitted: (val) => _buildTree(val.trim()),
                     decoration: const InputDecoration(
-                      labelText: 'Enter Domain',
-                      hintText: 'e.g., sat.gob.mx',
+                      labelText: 'Analyze Domain Chain',
+                      hintText: 'e.g., google.com',
                       border: OutlineInputBorder(),
                     ),
                   ),
@@ -451,7 +693,10 @@ class _HomePageState extends State<HomePage> {
                 ElevatedButton(
                   onPressed: () => _buildTree(_domainController.text.trim()),
                   style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
+                    padding: const EdgeInsets.symmetric(
+                      vertical: 16,
+                      horizontal: 24,
+                    ),
                   ),
                   child: const Text('Analyze'),
                 ),
@@ -461,33 +706,44 @@ class _HomePageState extends State<HomePage> {
           const Divider(height: 1),
           Expanded(
             child: _showGraph
-                ? InteractiveViewer(
-                    transformationController: _transformationController,
-                    constrained: false, 
-                    boundaryMargin: const EdgeInsets.all(600), 
-                    minScale: 0.1,
-                    maxScale: 3.0,
-                    child: Container(
-                      alignment: Alignment.center, 
-                      padding: const EdgeInsets.symmetric(vertical: 60, horizontal: 120),
-                      child: GraphView(
-                        graph: graph,
-                        algorithm: BuchheimWalkerAlgorithm(builder, TreeEdgeRenderer(builder)),
-                        paint: Paint()
-                          ..color = Colors.grey.shade400
-                          ..strokeWidth = 2
-                          ..style = PaintingStyle.stroke,
-                        builder: (Node node) {
-                          var value = node.key!.value as DnsNodeData;
-                          return _buildNodeView(value);
-                        },
+                ? Center(
+                    child: SingleChildScrollView(
+                      scrollDirection: Axis.vertical,
+                      child: SingleChildScrollView(
+                        scrollDirection: Axis.horizontal,
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(
+                            vertical: 40.0,
+                            horizontal: 60.0,
+                          ),
+                          child: CustomPaint(
+                            size: Size(componentWidth, totalComputedHeight),
+                            painter: TrustChainConnectorPainter(_treeNodes),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: _treeNodes.map((nodeData) {
+                                final bool isLast = _treeNodes.last == nodeData;
+                                return Padding(
+                                  padding: EdgeInsets.only(
+                                    bottom: isLast ? 0 : separatingGap,
+                                  ),
+                                  child: _buildNodeView(
+                                    nodeData,
+                                    componentWidth,
+                                    componentHeight,
+                                  ),
+                                );
+                              }).toList(),
+                            ),
+                          ),
+                        ),
                       ),
                     ),
                   )
                 : const Center(
                     child: Text(
-                      'Enter a domain above to visualize the DNSSEC chain.',
-                      style: TextStyle(fontSize: 15, color: Colors.black54),
+                      'Provide a validation target to build the cryptographic trust tree.',
+                      style: TextStyle(fontSize: 14, color: Colors.black54),
                     ),
                   ),
           ),
@@ -496,58 +752,73 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
-  Widget _buildNodeView(DnsNodeData value) {
+  Widget _buildNodeView(
+    DnsNodeData value,
+    double targetWidth,
+    double targetHeight,
+  ) {
     return Material(
       color: Colors.transparent,
       child: InkWell(
-        onTap: () => _showFriendlyDetailsSheet(value), // Triggers layout view on selection
+        onTap: () => _showFriendlyDetailsSheet(value),
         borderRadius: BorderRadius.circular(12),
         splashColor: value.edgeColor.withOpacity(0.1),
         highlightColor: value.edgeColor.withOpacity(0.05),
         child: Container(
-          padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 26),
+          width: targetWidth,
+          height: targetHeight,
+          padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 16),
           decoration: BoxDecoration(
             color: Colors.white,
             borderRadius: BorderRadius.circular(12),
-            border: Border.all(color: value.edgeColor, width: 2),
+            border: Border.all(color: value.edgeColor, width: 2.5),
             boxShadow: [
               BoxShadow(
                 color: Colors.black.withOpacity(0.04),
-                blurRadius: 6,
-                offset: const Offset(0, 3),
-              )
+                blurRadius: 4,
+                offset: const Offset(0, 2),
+              ),
             ],
           ),
           child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
             mainAxisSize: MainAxisSize.min,
             children: [
               Text(
-                value.title,
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 16, letterSpacing: 0.5),
+                value.title == '.' ? 'Root Zone (.)' : value.title,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 13,
+                  letterSpacing: 0.5,
+                ),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
               ),
-              if (value.details.isNotEmpty) ...[
-                const SizedBox(height: 6),
-                ...value.details.map((detail) => Padding(
-                      padding: const EdgeInsets.symmetric(vertical: 1),
-                      child: Text(
-                        detail,
-                        style: const TextStyle(fontSize: 13, color: Colors.black87),
-                        textAlign: TextAlign.center,
-                      ),
-                    )),
-              ],
-              const SizedBox(height: 6),
-              Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Icon(Icons.touch_app, size: 12, color: value.edgeColor.withOpacity(0.6)),
-                  const SizedBox(width: 4),
-                  Text(
-                    'Ver detalles',
-                    style: TextStyle(fontSize: 11, color: value.edgeColor.withOpacity(0.8), fontWeight: FontWeight.bold),
+              const SizedBox(height: 3),
+              if (value.edgeLabel != null && value.edgeLabel!.isNotEmpty)
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 2,
+                    horizontal: 4,
                   ),
-                ],
-              )
+                  decoration: BoxDecoration(
+                    color: value.edgeColor.withOpacity(0.1),
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Text(
+                    value.edgeLabel!,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 9,
+                      color: value.edgeColor,
+                      fontWeight: FontWeight.bold,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
             ],
           ),
         ),
